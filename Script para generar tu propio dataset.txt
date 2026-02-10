@@ -1,0 +1,208 @@
+Script para generar tu propio dataset desde la API
+
+1. ejecutas:
+pip install mp-api pandas
+
+2. luego:
+!pip install matminer
+
+3. ejecutas este código:
+
+from mp_api.client import MPRester
+import pandas as pd
+import json
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# ---------------------------------------------------------
+# 1. CONFIGURACIÓN
+# ---------------------------------------------------------
+MAPI_KEY = "TU_KEY_API_REAL"  # Reemplaza con tu clave real
+RANGO_GAP = (1.0, 1.8)  # Rango óptimo de Band Gap
+
+# ---------------------------------------------------------
+# 2. FUNCIÓN SIMPLIFICADA PARA IDENTIFICAR PEROVSKITAS
+# ---------------------------------------------------------
+def es_posible_perovskita(formula):
+    """
+    Verificación básica basada en fórmula química
+    """
+    try:
+        # Fórmulas comunes de perovskitas: ABX3 donde X suele ser O, F, Cl, etc.
+        # Para simplificar, asumimos que cualquier material ternario podría ser perovskita
+        elementos = []
+        current_element = ""
+
+        # Parsear la fórmula para obtener elementos
+        for char in formula:
+            if char.isupper():
+                if current_element:
+                    elementos.append(current_element)
+                current_element = char
+            elif char.islower():
+                current_element += char
+            elif char.isdigit():
+                # Ignorar números por ahora
+                continue
+
+        if current_element:
+            elementos.append(current_element)
+
+        # Debe tener exactamente 3 elementos distintos
+        elementos_unicos = list(set(elementos))
+        return len(elementos_unicos) == 3
+
+    except Exception as e:
+        print(f"⚠️ Error analizando fórmula {formula}: {e}")
+        return False
+
+# ---------------------------------------------------------
+# 3. CONEXIÓN Y DESCARGA DE DATOS (VERSIÓN CORREGIDA)
+# ---------------------------------------------------------
+print("📡 Conectando a la base de datos de Materials Project...")
+
+# Inicializar la variable fuera del try para evitar NameError
+datos_recolectados = []
+
+try:
+    with MPRester(MAPI_KEY) as mpr:
+        print("🔍 Buscando candidatos ternarios estables...")
+
+        # CONSULTA CORREGIDA - usar parámetros compatibles
+        docs_perovskitas = mpr.materials.summary.search(
+            # Parámetros corregidos para la nueva API
+            is_stable=True,
+            elements=[None, None, None],  # Exactamente 3 elementos
+            band_gap=(0, 10),  # Rango amplio de band gap
+            fields=[
+                "material_id", "formula_pretty", "band_gap",
+                "density", "formation_energy_per_atom",
+                "is_stable", "structure"
+            ],
+            chunk_size=1000,  # Reducir tamaño para mayor estabilidad
+            num_chunks=1
+        )
+
+        print(f"✅ Se han descargado metadatos de {len(docs_perovskitas)} materiales ternarios.")
+
+        # ---------------------------------------------------------
+        # 4. PROCESAR Y FILTRAR DATOS
+        # ---------------------------------------------------------
+        materiales_con_gap = 0
+
+        for i, doc in enumerate(docs_perovskitas):
+            # Mostrar progreso cada 100 materiales
+            if i % 100 == 0:
+                print(f"📊 Procesando material {i+1}/{len(docs_perovskitas)}...")
+
+            # Verificar que band_gap no sea None
+            if doc.band_gap is None:
+                continue
+
+            # Aplicar filtro de band gap LOCALMENTE
+            if RANGO_GAP[0] <= doc.band_gap <= RANGO_GAP[1]:
+                materiales_con_gap += 1
+
+                # Determinar si es posible perovskita
+                es_perovskita = es_posible_perovskita(doc.formula_pretty)
+
+                datos_recolectados.append({
+                    "Material_ID": doc.material_id,
+                    "Formula": doc.formula_pretty,
+                    "Band_Gap_eV": doc.band_gap,
+                    "Densidad_g_cm3": doc.density,
+                    "Energia_Formacion_eV": doc.formation_energy_per_atom,
+                    "Es_Estable": doc.is_stable,
+                    "Es_Perovskita": es_perovskita,
+                    "Structure_JSON": json.dumps(doc.structure.as_dict())
+                })
+
+        print(f"🎯 Materiales en rango de band gap {RANGO_GAP}: {materiales_con_gap}")
+
+except Exception as e:
+    print(f"❌ Error en la conexión o descarga: {e}")
+    print("💡 Intentando método alternativo...")
+
+    # Método alternativo si el primero falla
+    try:
+        with MPRester(MAPI_KEY) as mpr:
+            print("🔄 Intentando consulta alternativa...")
+
+            # Consulta más simple sin filtros complejos
+            all_docs = mpr.materials.summary.search(
+                num_elements=3,
+                fields=[
+                    "material_id", "formula_pretty", "band_gap",
+                    "density", "formation_energy_per_atom",
+                    "is_stable", "structure"
+                ],
+                chunk_size=500
+            )
+
+            print(f"✅ Descargados {len(all_docs)} materiales (método alternativo)")
+
+            # Filtrar localmente
+            for i, doc in enumerate(all_docs):
+                if i % 100 == 0:
+                    print(f"📊 Procesando {i+1}/{len(all_docs)}...")
+
+                if (doc.band_gap is not None and
+                    doc.is_stable and
+                    RANGO_GAP[0] <= doc.band_gap <= RANGO_GAP[1]):
+
+                    datos_recolectados.append({
+                        "Material_ID": doc.material_id,
+                        "Formula": doc.formula_pretty,
+                        "Band_Gap_eV": doc.band_gap,
+                        "Densidad_g_cm3": doc.density,
+                        "Energia_Formacion_eatoms": doc.formation_energy_per_atom,
+                        "Es_Estable": doc.is_stable,
+                        "Es_Perovskita": es_posible_perovskita(doc.formula_pretty),
+                        "Structure_JSON": json.dumps(doc.structure.as_dict())
+                    })
+
+    except Exception as e2:
+        print(f"❌ Error también en método alternativo: {e2}")
+
+# ---------------------------------------------------------
+# 5. CREAR DATAFRAME Y GUARDAR RESULTADOS
+# ---------------------------------------------------------
+if not datos_recolectados:
+    print("❌ No se encontraron datos que cumplan los criterios.")
+else:
+    # Crear DataFrame
+    df = pd.DataFrame(datos_recolectados)
+
+    # Verificar que la columna existe antes de usarla
+    print(f"\n🔍 Columnas disponibles en el DataFrame: {list(df.columns)}")
+    print(f"📊 Total de muestras encontradas: {len(df)}")
+
+    # Guardar dataset completo
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nombre_archivo_completo = f"dataset_perovskitas_{timestamp}.csv"
+    df.to_csv(nombre_archivo_completo, index=False)
+
+    print(f"💾 Dataset guardado como '{nombre_archivo_completo}'")
+
+    # Si existe la columna Es_Perovskita, mostrar estadísticas
+    if 'Es_Perovskita' in df.columns:
+        df_perovskitas = df[df['Es_Perovskita'] == True]
+        print(f"🔬 Posibles perovskitas identificadas: {len(df_perovskitas)}")
+
+        if len(df_perovskitas) > 0:
+            nombre_archivo_perovskitas = f"perovskitas_filtradas_{timestamp}.csv"
+            df_perovskitas.to_csv(nombre_archivo_perovskitas, index=False)
+            print(f"💾 Perovskitas guardadas como '{nombre_archivo_perovskitas}'")
+
+            # Mostrar algunas perovskitas identificadas
+            print(f"\n🔍 Primeras perovskitas identificadas:")
+            print(df_perovskitas[['Material_ID', 'Formula', 'Band_Gap_eV']].head().to_string(index=False))
+
+    # Mostrar estadísticas básicas
+    print(f"\n📈 ESTADÍSTICAS FINALES:")
+    print(f"   • Total de materiales en rango {RANGO_GAP} eV: {len(df)}")
+    if len(df) > 0:
+        print(f"   • Rango de Band Gap: {df['Band_Gap_eV'].min():.2f} - {df['Band_Gap_eV'].max():.2f} eV")
+        print(f"   • Band Gap promedio: {df['Band_Gap_eV'].mean():.2f} eV")
